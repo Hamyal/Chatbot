@@ -1,0 +1,100 @@
+REST API Integration Guide
+Service: AI Data Utility APIPurpose: Provide simple REST APIs that allow an AI Agent or external systems to retrieve current time, current date, date-time information, and a list content pages from published materials.
+The Base URL will depend on the deployment environment.
+Example:
+https://stonecurators-backend.com:3000/api/aiData/gettime
+1. API Overview
+Endpoint
+Method
+Description
+Authentication
+/aiData/gettime
+GET
+Get the Vietnam current time
+No
+/aiData/getdate
+GET
+Get the Vietnam current date
+No
+/aiData/getdatetime
+GET
+Get the Vietnam current date and time
+No
+/aiData/get-material-content-pages
+GET
+Get content pages from published materials
+Yes
+2. Response Format
+All APIs return responses in a standard JSON format.
+Success Response
+{  "data": {}}
+Error Response
+{  "error": true,  "message": "Error message"}
+3. API Details
+3.1 Get Vietnam Current Time
+Endpoint
+GET /aiData/gettime
+Description
+Returns the Vietnam current time.
+Example Request
+GET https://stonecurators-backend.com:3000/api/aiData/gettime
+Example Response
+{  "data": "14:35:46"}
+3.2 Get Vietnam Current Date
+Endpoint
+GET /aiData/getdate
+Description
+Returns the Vietnam current date.
+Example Request
+GET https://stonecurators-backend.com:3000/api/aiData/getdate
+Example Response
+{  "data": "2026-03-06"}
+3.3 Get Vietnam Current Date and Time
+Endpoint
+GET /aiData/getdatetime
+Description
+Returns the Vietnam current date and time.
+Example Request
+GET https://stonecurators-backend.com:3000/api/aiData/getdatetime
+Example Response
+{  "data":"2026-03-06 14:36:39"
+}
+3.4 Get content pages from published materials
+Endpoint
+GET /aiData/get-material-content-pages
+Description
+Returns a list of content pages from published materials that are marked as published in the system.
+This API is designed to allow AI agents or external applications to:
+search for content pages from published materials
+display available content pages from published materials
+support chatbot product search functionality
+Only material content pages with the following condition will be returned:
+published = true
+Authentication
+This endpoint requires API Key authentication.
+The API key is validated using:
+authController.validateKey()
+The key should be included in the request header.
+Example Header
+x-api-key: a7f3e2c1d8b4f6a9e5c3d8b1f0a4e7c2
+Example Request
+GET https://stonecurators-backend.com:3000/api/aiData/get-material-content-pages
+Headers
+x-api-key: a7f3e2c1d8b4f6a9e5c3d8b1f0a4e7c2
+Example Response
+[
+{
+"page_content": "# Material Name: Absolute Black Granite\r\n## Catalog Number: M608\r\n## Material URL: https://www.stonecurators.com/material/608/\r\n## A quarried granite from India\r\n## Dominant colors can include: Grays, Blacks\r\n## Color patterns can include: Speckled - Fine, Regular, Blotched, Solid\r\n## The feeling created by this combination of color and pattern can include: Cool, Warm\r\n## Facing surface finishes can include:\r\n### Polished which can be used for Interior Paving\r\n### Flamed which can be used for Exterior Paving\r\n## General applications for this stone include: Building Stone, Indoor Use, Commercial Use, Landscape Stone, Outdoor Use, Residential Use\r\n## Especially suitable for: Freeze-Thaw Conditions, High Heels, High Traffic, Low Slipperiness\r\n## Can be cut-to-size to your specifications\r\n## Lead time from order to delivery is approximately 4-8 weeks\r\n## Compared to others in its category this stone is higher priced\r\n"
+},
+…
+]
+4. Example Integration
+Example using JavaScript (Fetch API)
+const response = await fetch(  " https://stonecurators-backend.com:3000/api/aiData/getdatetime");const data = await response.json();console.log(data);
+Example calling the Materials API
+const response = await fetch(  " https://stonecurators-backend.com:3000/api/aiData/get-material-content-pages",  {    headers: {      "x-api-key": "a7f3e2c1d8b4f6a9e5c3d8b1f0a4e7c2"    }  });const materials = await response.json();
+5. Error Handling
+Invalid API Key
+{  "error": true,  "message": "Invalid API key"}
+Invalid Request
+{  "error": true,  "message": " Failed to retrieve content pages from published materials"}

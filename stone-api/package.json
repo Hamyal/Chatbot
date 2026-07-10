@@ -1,0 +1,21 @@
+{
+  "name": "stone-api",
+  "version": "1.0.0",
+  "description": "Stone product REST API for AI tool runtime",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "validate:schema": "node scripts/validate-schema.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "mysql2": "^3.20.0"
+  }
+}

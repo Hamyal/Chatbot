@@ -1,0 +1,233 @@
+Choose OpenAI Tool Selection Agent (runtime tool calling) instead of letting OpenAI generate SQL queries
+1. Solution Overview
+System Objective
+Build an AI chatbot system that allows users to search for natural stone products using natural language.
+Examples:
+"Find white marble slabs"
+"Black granite stone”
+"Stone for paving"
+The system flow:
+User
+↓
+Chatbot UI
+↓
+OpenAI Tool Selection
+↓
+REST API
+↓
+MySQL
+The AI is not allowed to access the database directly.
+2. Implemented Architecture
+Overall Architecture
+Browser (Next.js Chatbot)
+↓
+Next.js API Route (AI Agent Runtime)
+↓
+OpenAI Tool Calling
+↓
+NodeJS REST API
+↓
+MySQL Database
+Components
+1️⃣ Chatbot UI
+Next.js frontend
+Simple chat form
+User enters questions
+Example:
+Find white marble
+2️⃣ AI Agent Runtime
+File:
+stone-ai-chat/app/api/chat/route.js
+Responsibilities:
+Send user questions to OpenAI
+OpenAI selects a tool
+Runtime calls the REST API
+Returns results to OpenAI
+OpenAI responds to the user
+3️⃣ REST API Server
+File:
+stone-api/server.js
+Responsibilities:
+Search products
+Query MySQL
+Return JSON
+Example:
+POST /api/search/products
+3. Tool Selection Architecture (Recommended)
+How It Works
+Step 1
+User input:
+Find white marble slabs
+Step 2
+OpenAI analyzes the intent:
+search_products
+Arguments:
+{
+query: "white marble slabs",
+material: "marble",
+type: "slab"
+}
+Step 3
+Runtime calls the API:
+POST /api/search/products
+Step 4
+REST API queries MySQL:
+SELECT * FROM stone
+WHERE material_id = 4
+AND type_id = 4
+Step 5
+OpenAI responds:
+I found 12 white marble slabs.
+4. Why NOT Use AI-Generated SQL
+Risky Approach
+User
+↓
+OpenAI generates SQL
+↓
+Database
+Example:
+SELECT * FROM stone
+WHERE material='marble'
+Main Risks
+1️⃣ SQL Injection Risk
+AI may generate dangerous queries.
+Examples:
+DROP TABLE stone
+or
+DELETE FROM stone
+This is a real-world risk.
+Evidence
+OpenAI recommends not allowing AI to query databases directly.
+OpenAI Cookbook:
+https://cookbook.openai.com/examples/how_to_call_functions_with_chat_models
+OpenAI recommendation:
+Use function calling instead of direct database access.
+Microsoft Recommendation
+Microsoft Azure OpenAI:
+https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/function-calling
+Recommendation:
+Use tools or APIs instead of allowing the model to generate SQL queries directly.
+OWASP Warning About LLM Injection
+OWASP Top 10 for LLM:
+https://owasp.org/www-project-top-10-for-large-language-model-applications/
+Risk:
+Prompt injection can lead to data exfiltration or unsafe queries.
+5. Architecture Comparison
+AI-Generated SQL
+User → AI → SQL → Database
+Advantages:
+Fast setup
+Disadvantages:
+No SQL control
+High security risk
+Hard to audit
+Unpredictable behavior
+Not production-safe
+Tool Selection Architecture
+User → AI → Tool → REST API → DB
+Advantages:
+✅ Secure✅ Predictable✅ Controlled SQL✅ Audit logs✅ Scalable✅ Production-ready
+Disadvantages:
+Requires coding
+6. Reasons for Choosing Tool Selection Runtime
+Technical Reasons
+1️⃣ 100% SQL Control
+SQL exists only on the server:
+server.js
+AI never sees the SQL.
+2️⃣ No SQL Injection
+Using prepared statements:
+pool.execute(sql, params)
+3️⃣ Predictable Behavior
+AI can only call:
+search_products
+get_product_detail
+get_vietnam_time
+No random queries are possible.
+4️⃣ Easy Logging
+You can log:
+Search queries
+SQL statements
+Parameters
+5️⃣ Good Performance
+Per request:
+1 MySQL query
+7. System Build Guide
+Step 1 — Build REST API
+Create project:
+npm init
+npm install express mysql2 cors dotenv
+db.js
+Connection pool:
+mysql.createPool()
+server.js
+APIs:
+GET /question
+POST /api/search/products
+GET /api/products/:code
+Step 2 — Build Chatbot
+Create Next.js project:
+npx create-next-app
+page.tsx
+UI:
+textbox
+send button
+Step 3 — Tool Runtime
+File:
+route.js
+Define tools:
+search_products
+get_product_detail
+get_vietnam_time
+8. Tool Selection Mechanism (Most Important)
+OpenAI does not randomly choose tools.
+OpenAI uses semantic matching.
+Example:
+User:
+get the time
+Tool:
+get_vietnam_time
+AI selects this tool.
+Example:
+User:
+show granite stone
+AI selects:
+search_products
+Tool Schema Determines Behavior
+Example:
+Description:
+Search stone products
+AI will understand the tool’s purpose.
+9. Scalability
+New tools can be added easily.
+Example:
+Tool:
+check_stock
+Just add it to:
+tools[]
+Done.
+Future Tools Examples
+create_order
+check_price
+check_inventory
+recommend_products
+10. Business Benefits
+Security
+Database is not exposed.
+Stability
+No incorrect queries.
+Scalability
+Easy to expand.
+Maintainability
+Easy to modify and maintain.
+11. Conclusion (Important)
+The Tool Selection Runtime solution is:
+Secure
+Production-safe
+Scalable
+Recommended by OpenAI
+Recommended by Microsoft
+Suitable for production environments.
+12. Instructions for running the demo
+Please read the file demo/readme.md
+Below is some example in demo application.

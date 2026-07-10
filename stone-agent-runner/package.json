@@ -1,0 +1,20 @@
+{
+  "name": "stone-agent-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone runner for an OpenAI Agents SDK agent/workflow",
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@openai/agents": "^0.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.20.0",
+    "typescript": "^5"
+  }
+}
