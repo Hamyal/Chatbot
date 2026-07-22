@@ -29,14 +29,16 @@ const TOOL_NAMES = {
   SEARCH_PRODUCTS: "search_products",
   GET_PRODUCT_DETAIL: "get_product_detail",
   GET_VIETNAM_TIME: "get_vietnam_time",
+  GET_MATERIAL_CONTENT_PAGES: "get_material_content_pages",
 } as const;
 
 /** Human-readable labels shown in the activity panel. */
 const TOOL_LABELS: Record<string, string> = {
   [TOOL_NAMES.SEARCH_KNOWLEDGE]: "Knowledge retrieval (vector store)",
-  [TOOL_NAMES.SEARCH_PRODUCTS]: "Catalog search (REST API)",
-  [TOOL_NAMES.GET_PRODUCT_DETAIL]: "Product lookup (REST API)",
+  [TOOL_NAMES.SEARCH_PRODUCTS]: "Catalog search (Stone Curators API)",
+  [TOOL_NAMES.GET_PRODUCT_DETAIL]: "Catalog lookup by code",
   [TOOL_NAMES.GET_VIETNAM_TIME]: "Time lookup (REST API)",
+  [TOOL_NAMES.GET_MATERIAL_CONTENT_PAGES]: "Published materials list",
 };
 
 const openaiTools: OpenAI.Chat.ChatCompletionTool[] = [
@@ -147,6 +149,17 @@ const openaiTools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: TOOL_NAMES.GET_MATERIAL_CONTENT_PAGES,
+      description:
+        "List all published material content pages from the catalog. Use when " +
+        "the visitor wants to browse what materials are available rather than " +
+        "search for something specific.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: TOOL_NAMES.GET_VIETNAM_TIME,
       description:
         "Get Vietnam timezone current time, date only, or full date-time.",
@@ -203,6 +216,27 @@ async function callBackend(path: string, options?: RequestInit) {
 }
 
 /**
+ * Catalog text search.
+ *
+ * Per the integration guide the keyword goes in as a bare query string with
+ * `+` between words — e.g. `/aiData/getsearch?gray+granite+in+a+cool+tone` —
+ * not as a named `keyword=` parameter.
+ */
+async function callSearch(keywords: string) {
+  const words = keywords
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => encodeURIComponent(w));
+  if (!words.length) {
+    return { error: true, message: "Empty search keywords" };
+  }
+  return await callBackend(`/aiData/getsearch?${words.join("+")}`, {
+    headers: { "x-api-key": process.env.AI_DATA_API_KEY || "" },
+  });
+}
+
+/**
  * Search the configured vector store. Kept as an explicit tool (rather than
  * the built-in server-side file_search) so retrieval shows up as its own
  * visible step in the activity panel.
@@ -244,7 +278,18 @@ function summarizeResult(name: string, result: unknown): string {
     if (name === TOOL_NAMES.SEARCH_KNOWLEDGE) {
       return `${data.length} knowledge passage(s) retrieved`;
     }
-    return `${data.length} result(s)`;
+    // Catalog pages carry their catalog number inside the markdown content;
+    // surfacing the codes makes the activity panel genuinely informative.
+    const codes = data
+      .map((row) => {
+        const text = (row as { page_content?: string })?.page_content ?? "";
+        return text.match(/Catalog Number:\s*([A-Za-z]?\d+)/)?.[1];
+      })
+      .filter(Boolean)
+      .slice(0, 6);
+    return codes.length
+      ? `${data.length} result(s): ${codes.join(", ")}${data.length > codes.length ? ", …" : ""}`
+      : `${data.length} result(s)`;
   }
   if (data && typeof data === "object") {
     const code = (data as { code?: string }).code;
@@ -272,10 +317,12 @@ async function executeToolCall(
         return await searchVectorStore(client, String(args.query ?? ""));
 
       case TOOL_NAMES.SEARCH_PRODUCTS: {
-        // The catalog endpoint takes query/material/type. Richer criteria are
-        // still captured (and shown in the activity panel), then folded into
-        // the free-text query so nothing the visitor said is lost.
-        const extraKeys = [
+        // Every criterion the visitor gave is folded into one keyword string —
+        // the catalog's text search scores against rich content embeddings that
+        // already cover origin, finish, suitability, shape, lead time & price.
+        const criteriaKeys = [
+          "material",
+          "type",
           "color",
           "finish",
           "application",
@@ -285,29 +332,28 @@ async function executeToolCall(
           "cost",
           "product_name",
         ];
-        const extras = extraKeys
+        const extras = criteriaKeys
           .map((k) => String(args[k] ?? "").trim())
           .filter(Boolean)
           .join(" ");
-        const query = [String(args.query ?? "").trim(), extras]
+        const keywords = [String(args.query ?? "").trim(), extras]
           .filter(Boolean)
           .join(" ");
-
-        return await callBackend("/search/products", {
-          method: "POST",
-          body: JSON.stringify({
-            query,
-            material: String(args.material ?? ""),
-            type: String(args.type ?? ""),
-          }),
-        });
+        return await callSearch(keywords);
       }
 
       case TOOL_NAMES.GET_PRODUCT_DETAIL: {
-        const code = String(args.code ?? "").trim().toUpperCase();
+        const code = String(args.code ?? "").trim();
         if (!code) return { error: true, message: "Missing product code" };
-        return await callBackend(`/products/${encodeURIComponent(code)}`);
+        // The catalog has no by-code endpoint; the code itself is a strong
+        // search keyword because it appears in each page's content.
+        return await callSearch(code);
       }
+
+      case TOOL_NAMES.GET_MATERIAL_CONTENT_PAGES:
+        return await callBackend("/aiData/get-material-content-pages", {
+          headers: { "x-api-key": process.env.AI_DATA_API_KEY || "" },
+        });
 
       case TOOL_NAMES.GET_VIETNAM_TIME: {
         const kind = String(args.kind ?? "datetime");
@@ -384,6 +430,14 @@ const SYSTEM_PROMPT =
   "stone, and offer to help with that instead.\n\n" +
   "Other tools:\n" +
   "- get_vietnam_time: time or date questions.\n\n" +
+  "About catalog results:\n" +
+  "- Results come back as markdown content pages. Each has a Catalog Number " +
+  "(P… = a product, M… = a material), a Product/Material URL, often an Image " +
+  "URL, plus origin, colors, patterns, finishes, applications, specific uses, " +
+  "suitability, shapes, lead time, relative price and related products.\n" +
+  "- Read those pages and answer from them. Quote the catalog number and " +
+  "include the Product/Material URL so the visitor can click through.\n" +
+  "- Higher 'Search Match Score' means a better match; lead with those.\n\n" +
   "Grounding rules:\n" +
   "- Answer general questions using ONLY the content returned by " +
   "search_stone_knowledge. Do not fill gaps from your own knowledge.\n" +
