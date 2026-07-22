@@ -370,9 +370,18 @@ async function executeToolCall(
         return { error: true, message: `Unknown tool: ${name}` };
     }
   } catch (e) {
+    const message = e instanceof Error ? e.message : "Tool execution failed";
+    // Steer the model to the knowledge base rather than letting it retry a
+    // failing endpoint or give up on the visitor.
+    const isCatalog =
+      name === TOOL_NAMES.SEARCH_PRODUCTS ||
+      name === TOOL_NAMES.GET_PRODUCT_DETAIL ||
+      name === TOOL_NAMES.GET_MATERIAL_CONTENT_PAGES;
     return {
       error: true,
-      message: e instanceof Error ? e.message : "Tool execution failed",
+      message: isCatalog
+        ? `${message}. Do not retry this tool — call search_stone_knowledge with the same request instead.`
+        : message,
     };
   }
 }
@@ -438,6 +447,12 @@ const SYSTEM_PROMPT =
   "- Read those pages and answer from them. Quote the catalog number and " +
   "include the Product/Material URL so the visitor can click through.\n" +
   "- Higher 'Search Match Score' means a better match; lead with those.\n\n" +
+  "If the catalog search fails:\n" +
+  "- Do NOT retry the same tool and do NOT tell the visitor you cannot help. " +
+  "Immediately call search_stone_knowledge with the same request instead — the " +
+  "knowledge base also holds material content pages with catalog numbers and " +
+  "product URLs, so it can usually answer the question.\n" +
+  "- Only say you could not find products if BOTH sources come back empty.\n\n" +
   "Grounding rules:\n" +
   "- Answer general questions using ONLY the content returned by " +
   "search_stone_knowledge. Do not fill gaps from your own knowledge.\n" +
