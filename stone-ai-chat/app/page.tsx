@@ -10,16 +10,27 @@ import {
 
 const SPLASH_MS = 2000;
 
+/** One visible unit of work the agent performed. */
+type Step = {
+  id: string;
+  kind: string;
+  title: string;
+  detail?: string;
+  status: "running" | "done" | "error";
+  ms?: number;
+};
+
 type ChatMessage = {
   role: "assistant" | "user";
   content: string;
   time: string;
+  steps?: Step[];
 };
 
 const quickPrompts = [
   "Show black granite for exterior paving",
-  "Find low-slippery stone for high traffic",
-  "What is the current Vietnam time?",
+  "What is the difference between honed and polished?",
+  "Which white ones do you have?",
 ] as const;
 
 const initialMessages: ChatMessage[] = [
@@ -44,11 +55,73 @@ function plainChatText(input: string): string {
   return s;
 }
 
+const STEP_STYLES: Record<Step["status"], string> = {
+  running: "bg-amber-400 animate-pulse",
+  done: "bg-emerald-500",
+  error: "bg-rose-500",
+};
+
+const KIND_LABELS: Record<string, string> = {
+  intent: "Intent / routing",
+  tool: "Tool call",
+  generate: "Response",
+};
+
+function ActivityPanel({
+  steps,
+  live,
+}: {
+  steps: Step[];
+  live?: boolean;
+}) {
+  if (!steps.length) return null;
+  return (
+    <div className="mt-2 rounded-xl border border-slate-200 bg-slate-50/80 p-3">
+      <p className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+        <span>AI activity</span>
+        {live && (
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
+        )}
+      </p>
+      <ol className="flex flex-col gap-2">
+        {steps.map((step) => (
+          <li key={step.id} className="flex gap-2.5">
+            <span
+              className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${STEP_STYLES[step.status]}`}
+              aria-hidden
+            />
+            <div className="min-w-0 flex-1">
+              <p className="flex flex-wrap items-baseline gap-x-2 text-xs font-medium text-slate-800">
+                <span>{step.title}</span>
+                <span className="text-[10px] font-normal uppercase tracking-wide text-slate-400">
+                  {KIND_LABELS[step.kind] || step.kind}
+                </span>
+                {typeof step.ms === "number" && (
+                  <span className="text-[10px] font-normal text-slate-400">
+                    {step.ms} ms
+                  </span>
+                )}
+              </p>
+              {step.detail && (
+                <p className="mt-0.5 break-words font-mono text-[11px] leading-relaxed text-slate-500">
+                  {step.detail}
+                </p>
+              )}
+            </div>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [isThinking, setIsThinking] = useState(false);
   const [showChat, setShowChat] = useState(false);
+  const [liveSteps, setLiveSteps] = useState<Step[]>([]);
+  const [showActivity, setShowActivity] = useState(true);
 
   useEffect(() => {
     const id = window.setTimeout(() => setShowChat(true), SPLASH_MS);
@@ -68,13 +141,48 @@ export default function Home() {
     setMessages(nextMessages);
     setInput("");
     setIsThinking(true);
+    setLiveSteps([]);
+
+    // Steps accumulate here as the stream arrives, then get attached to the
+    // finished assistant message so the trace stays visible in the transcript.
+    const collected: Step[] = [];
+    let answer = "";
+    let failure = "";
+
+    const applyEvent = (event: Record<string, unknown>) => {
+      if (event.t === "step") {
+        const id = String(event.id);
+        const existing = collected.findIndex((s) => s.id === id);
+        if (existing === -1) {
+          collected.push({
+            id,
+            kind: String(event.kind ?? ""),
+            title: String(event.title ?? ""),
+            detail: event.detail ? String(event.detail) : undefined,
+            status: (event.status as Step["status"]) ?? "running",
+            ms: typeof event.ms === "number" ? event.ms : undefined,
+          });
+        } else {
+          const prev = collected[existing];
+          collected[existing] = {
+            ...prev,
+            status: (event.status as Step["status"]) ?? prev.status,
+            detail: event.detail ? String(event.detail) : prev.detail,
+            ms: typeof event.ms === "number" ? event.ms : prev.ms,
+          };
+        }
+        setLiveSteps([...collected]);
+      } else if (event.t === "answer") {
+        answer = String(event.answer ?? "");
+      } else if (event.t === "error") {
+        failure = String(event.message ?? "Unknown error");
+      }
+    };
 
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Send the whole conversation so the agent keeps context and can
-        // re-route to the right tool when the topic changes mid-chat.
         body: JSON.stringify({
           messages: nextMessages.map(({ role, content }) => ({
             role,
@@ -84,35 +192,50 @@ export default function Home() {
         signal: AbortSignal.timeout(120_000),
       });
 
-      const raw = await response.text();
-      let payload: {
-        data?: { answer?: string };
-        message?: string;
-        error?: boolean;
-      };
-      try {
-        payload = JSON.parse(raw) as typeof payload;
-      } catch {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content:
-              "The server returned an invalid response. Check that stone-api is running on port 3001 and restart Next.js.",
-            time: getClockTime(),
-          },
-        ]);
-        return;
+      if (!response.body) {
+        throw new Error("No response stream from server");
       }
 
-      const assistantText =
-        payload?.data?.answer ||
-        payload?.message ||
-        "I could not generate a response.";
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      // NDJSON: one JSON event per line; the tail may be a partial line.
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            applyEvent(JSON.parse(line) as Record<string, unknown>);
+          } catch {
+            /* ignore malformed line */
+          }
+        }
+      }
+      if (buffer.trim()) {
+        try {
+          applyEvent(JSON.parse(buffer) as Record<string, unknown>);
+        } catch {
+          /* ignore trailing partial */
+        }
+      }
 
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: assistantText, time: getClockTime() },
+        {
+          role: "assistant",
+          content:
+            answer ||
+            (failure
+              ? `Something went wrong: ${failure}`
+              : "I could not generate a response."),
+          time: getClockTime(),
+          steps: collected,
+        },
       ]);
     } catch (err) {
       const isAbort = err instanceof Error && err.name === "TimeoutError";
@@ -124,10 +247,12 @@ export default function Home() {
             ? "Request timed out. Try a shorter message or check your network and OpenAI API."
             : "Connection failed. Start stone-api (port 3001) and stone-ai-chat, then try again.",
           time: getClockTime(),
+          steps: collected,
         },
       ]);
     } finally {
       setIsThinking(false);
+      setLiveSteps([]);
     }
   };
 
@@ -174,9 +299,7 @@ export default function Home() {
 
       <main
         className={`mx-auto flex h-[calc(100vh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-xl transition-all duration-700 ease-out md:h-[calc(100vh-4rem)] ${
-          showChat
-            ? "translate-y-0 opacity-100"
-            : "translate-y-4 opacity-0"
+          showChat ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
         }`}
       >
         <header className="border-b border-slate-200 bg-white px-5 py-4">
@@ -190,6 +313,18 @@ export default function Home() {
               </h1>
             </div>
             <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowActivity((v) => !v)}
+                aria-pressed={showActivity}
+                className={`rounded-full px-3 py-1 text-xs font-medium transition ${
+                  showActivity
+                    ? "bg-slate-900 text-white"
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                }`}
+              >
+                {showActivity ? "Hide AI activity" : "Show AI activity"}
+              </button>
               <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
                 {messageCount} messages
               </span>
@@ -236,6 +371,9 @@ export default function Home() {
                   >
                     {isUser ? message.content : plainChatText(message.content)}
                   </p>
+                  {!isUser && showActivity && message.steps?.length ? (
+                    <ActivityPanel steps={message.steps} />
+                  ) : null}
                   <p
                     className={`mt-2 text-right text-[11px] ${
                       isUser ? "text-slate-300" : "text-slate-500"
@@ -249,6 +387,7 @@ export default function Home() {
             {isThinking && (
               <article className="max-w-[85%] rounded-2xl bg-white px-4 py-3 text-slate-600 shadow-sm ring-1 ring-slate-200">
                 <p className="text-sm leading-relaxed">Thinking...</p>
+                {showActivity && <ActivityPanel steps={liveSteps} live />}
               </article>
             )}
           </div>
@@ -280,7 +419,8 @@ export default function Home() {
             </button>
           </form>
           <p className="mx-auto mt-2 max-w-3xl text-xs text-slate-500">
-            Responses are generated using tool-calling to your REST API.
+            Responses use tool-calling to the Stone REST API and the stone
+            knowledge vector store.
           </p>
         </footer>
       </main>

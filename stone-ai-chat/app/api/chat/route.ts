@@ -1,49 +1,128 @@
 import OpenAI from "openai";
-import { NextResponse } from "next/server";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
+export const runtime = "nodejs";
+
+/**
+ * Streaming orchestrator.
+ *
+ * One agent holds every capability (stone knowledge via the vector store,
+ * catalog search via the REST API, product detail, time). It re-decides on
+ * every user message, so a follow-up that changes topic is routed correctly
+ * while keeping the full conversation context.
+ *
+ * The route streams NDJSON "step" events as work happens so the UI can show
+ * what the AI is thinking/doing: intent -> routing -> retrieval -> API call
+ * -> response generation.
+ */
+
 type ChatRequestBody = {
-  // Legacy single-message form (still supported for backwards compatibility).
   message?: string;
-  // Preferred form: full conversation so the agent keeps context and can
-  // re-route to the right tool when the user switches topic mid-chat.
   messages?: { role?: string; content?: string }[];
 };
 
-// Cap how much history we forward to keep token usage bounded on long chats.
 const MAX_HISTORY_MESSAGES = 20;
+const BACKEND_FETCH_MS = 25_000;
 
 const TOOL_NAMES = {
+  SEARCH_KNOWLEDGE: "search_stone_knowledge",
   SEARCH_PRODUCTS: "search_products",
   GET_PRODUCT_DETAIL: "get_product_detail",
   GET_VIETNAM_TIME: "get_vietnam_time",
-  GET_MATERIAL_CONTENT_PAGES: "get_material_content_pages",
 } as const;
+
+/** Human-readable labels shown in the activity panel. */
+const TOOL_LABELS: Record<string, string> = {
+  [TOOL_NAMES.SEARCH_KNOWLEDGE]: "Knowledge retrieval (vector store)",
+  [TOOL_NAMES.SEARCH_PRODUCTS]: "Catalog search (REST API)",
+  [TOOL_NAMES.GET_PRODUCT_DETAIL]: "Product lookup (REST API)",
+  [TOOL_NAMES.GET_VIETNAM_TIME]: "Time lookup (REST API)",
+};
 
 const openaiTools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
-      name: TOOL_NAMES.SEARCH_PRODUCTS,
+      name: TOOL_NAMES.SEARCH_KNOWLEDGE,
       description:
-        "Search natural stone products. Put use-cases (paving, flooring, outdoor) in query. Use material/type filters only for real catalog values.",
+        "Search the natural-stone knowledge base (vector store) for general " +
+        "information: what a material is, properties, finishes, care and " +
+        "maintenance, installation, comparisons, suitability advice. Use this " +
+        "for explanatory questions rather than catalog lookups.",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description:
-              "User intent: materials, colors, paving, outdoor, etc.",
+            description: "The information need, phrased as a search query.",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: TOOL_NAMES.SEARCH_PRODUCTS,
+      description:
+        "Search actual stone products in the catalog. Fill in every criterion " +
+        "the visitor mentioned — species, origin, source, color, finish, " +
+        "application, shape, lead time, cost, product name, catalog number.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The visitor's request in their own words.",
           },
           material: {
             type: "string",
             description:
-              "Only if user names a stone family: marble, granite, travertine, limestone, quartz. Otherwise empty.",
+              "Stone species/family if named: marble, granite, travertine, limestone, quartz.",
           },
           type: {
             type: "string",
             description:
-              "Only product form: slab, tile, or block. Never use paving here — put paving in query.",
+              "Product form only: slab, tile, or block. Never put paving here.",
+          },
+          color: {
+            type: "string",
+            description:
+              "Dominant color, color feeling (warm/cool/light/dark) or pattern (speckled, cloudy, streaks).",
+          },
+          finish: {
+            type: "string",
+            description:
+              "Surface finish: adze, split-face, honed, flamed, polished, tumbled, ...",
+          },
+          application: {
+            type: "string",
+            description:
+              "Use or suitability: exterior paving, wall cladding, pool deck, steps, landscape, freeze-thaw, not slippery, ...",
+          },
+          shape: {
+            type: "string",
+            description: "Shape: planks, cobble, mosaic, flagstone, veneer, ...",
+          },
+          origin: {
+            type: "string",
+            description:
+              "Where quarried or gathered, and/or source: Maine, Italy, reclaimed, gathered, quarried, ...",
+          },
+          lead_time: {
+            type: "string",
+            description:
+              "Delivery expectation: available inventory, quick ship, two weeks, 6-8 weeks, ...",
+          },
+          cost: {
+            type: "string",
+            description: "Relative cost: cheap, not expensive, $$, ...",
+          },
+          product_name: {
+            type: "string",
+            description:
+              "Exact product name if given, e.g. 'Strata Mist Cross-Cut Gneiss'.",
           },
         },
         required: ["query"],
@@ -59,10 +138,7 @@ const openaiTools: OpenAI.Chat.ChatCompletionTool[] = [
       parameters: {
         type: "object",
         properties: {
-          code: {
-            type: "string",
-            description: "Catalog code like M608.",
-          },
+          code: { type: "string", description: "Catalog code like M608." },
         },
         required: ["code"],
       },
@@ -73,45 +149,27 @@ const openaiTools: OpenAI.Chat.ChatCompletionTool[] = [
     function: {
       name: TOOL_NAMES.GET_VIETNAM_TIME,
       description:
-        "Get Vietnam timezone current time, date only, or full date-time. Pick kind from user intent.",
+        "Get Vietnam timezone current time, date only, or full date-time.",
       parameters: {
         type: "object",
         properties: {
           kind: {
             type: "string",
             enum: ["time", "date", "datetime"],
-            description:
-              "time = clock only, date = YYYY-MM-DD, datetime = both.",
+            description: "time = clock only, date = YYYY-MM-DD, datetime = both.",
           },
         },
         required: ["kind"],
       },
     },
   },
-  {
-    type: "function",
-    function: {
-      name: TOOL_NAMES.GET_MATERIAL_CONTENT_PAGES,
-      description:
-        "Fetch published material content pages (markdown text) for RAG-style answers. Requires server API key.",
-      parameters: {
-        type: "object",
-        properties: {},
-      },
-    },
-  },
 ];
-
-const BACKEND_FETCH_MS = 25_000;
 
 async function callBackend(path: string, options?: RequestInit) {
   const baseUrl = process.env.STONE_API_BASE_URL || "http://localhost:3001/api";
   const response = await fetch(`${baseUrl}${path}`, {
     ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(options?.headers || {}),
-    },
+    headers: { "Content-Type": "application/json", ...(options?.headers || {}) },
     cache: "no-store",
     signal: AbortSignal.timeout(BACKEND_FETCH_MS),
   });
@@ -127,10 +185,6 @@ async function callBackend(path: string, options?: RequestInit) {
         : `Backend error (${response.status})`
     );
   }
-  // The integration spec says some endpoints return bare JSON arrays
-  // (e.g. /aiData/get-material-content-pages, /aiData/getsearch). Normalize
-  // every response to { data, error, message } so the rest of this module
-  // can keep using `payload.data` everywhere.
   let payload: { data?: unknown; error?: boolean; message?: string };
   if (Array.isArray(parsed)) {
     payload = { data: parsed };
@@ -148,7 +202,63 @@ async function callBackend(path: string, options?: RequestInit) {
   return payload;
 }
 
-async function executeToolCall(name: string, argsJson: string) {
+/**
+ * Search the configured vector store. Kept as an explicit tool (rather than
+ * the built-in server-side file_search) so retrieval shows up as its own
+ * visible step in the activity panel.
+ */
+async function searchVectorStore(client: OpenAI, query: string) {
+  const vectorStoreId = process.env.OPENAI_VECTOR_STORE_ID?.trim();
+  if (!vectorStoreId) {
+    return {
+      error: true,
+      message:
+        "No vector store configured. Set OPENAI_VECTOR_STORE_ID to enable " +
+        "general stone knowledge retrieval.",
+    };
+  }
+
+  const result = await client.vectorStores.search(vectorStoreId, {
+    query,
+    max_num_results: 5,
+  });
+
+  const chunks = (result.data || []).map((item) => ({
+    filename: item.filename,
+    score: item.score,
+    text: (item.content || [])
+      .map((c) => ("text" in c ? c.text : ""))
+      .join("\n")
+      .slice(0, 4000),
+  }));
+
+  return { data: chunks, meta: { vectorStoreId, resultCount: chunks.length } };
+}
+
+/** Short human summary of a tool result for the activity panel. */
+function summarizeResult(name: string, result: unknown): string {
+  const payload = result as { data?: unknown; error?: boolean; message?: string };
+  if (payload?.error) return `Error: ${payload.message ?? "failed"}`;
+  const data = payload?.data;
+  if (Array.isArray(data)) {
+    if (name === TOOL_NAMES.SEARCH_KNOWLEDGE) {
+      return `${data.length} knowledge passage(s) retrieved`;
+    }
+    return `${data.length} result(s)`;
+  }
+  if (data && typeof data === "object") {
+    const code = (data as { code?: string }).code;
+    return code ? `Found ${code}` : "1 result";
+  }
+  if (typeof data === "string") return data;
+  return "done";
+}
+
+async function executeToolCall(
+  client: OpenAI,
+  name: string,
+  argsJson: string
+): Promise<unknown> {
   let args: Record<string, unknown> = {};
   try {
     args = JSON.parse(argsJson || "{}") as Record<string, unknown>;
@@ -158,24 +268,47 @@ async function executeToolCall(name: string, argsJson: string) {
 
   try {
     switch (name) {
+      case TOOL_NAMES.SEARCH_KNOWLEDGE:
+        return await searchVectorStore(client, String(args.query ?? ""));
+
       case TOOL_NAMES.SEARCH_PRODUCTS: {
-        const body = {
-          query: String(args.query ?? ""),
-          material: String(args.material ?? ""),
-          type: String(args.type ?? ""),
-        };
+        // The catalog endpoint takes query/material/type. Richer criteria are
+        // still captured (and shown in the activity panel), then folded into
+        // the free-text query so nothing the visitor said is lost.
+        const extraKeys = [
+          "color",
+          "finish",
+          "application",
+          "shape",
+          "origin",
+          "lead_time",
+          "cost",
+          "product_name",
+        ];
+        const extras = extraKeys
+          .map((k) => String(args[k] ?? "").trim())
+          .filter(Boolean)
+          .join(" ");
+        const query = [String(args.query ?? "").trim(), extras]
+          .filter(Boolean)
+          .join(" ");
+
         return await callBackend("/search/products", {
           method: "POST",
-          body: JSON.stringify(body),
+          body: JSON.stringify({
+            query,
+            material: String(args.material ?? ""),
+            type: String(args.type ?? ""),
+          }),
         });
       }
+
       case TOOL_NAMES.GET_PRODUCT_DETAIL: {
         const code = String(args.code ?? "").trim().toUpperCase();
-        if (!code) {
-          return { error: true, message: "Missing product code" };
-        }
+        if (!code) return { error: true, message: "Missing product code" };
         return await callBackend(`/products/${encodeURIComponent(code)}`);
       }
+
       case TOOL_NAMES.GET_VIETNAM_TIME: {
         const kind = String(args.kind ?? "datetime");
         const path =
@@ -186,25 +319,81 @@ async function executeToolCall(name: string, argsJson: string) {
               : "/aiData/getdatetime";
         return await callBackend(path);
       }
-      case TOOL_NAMES.GET_MATERIAL_CONTENT_PAGES: {
-        const apiKey = process.env.AI_DATA_API_KEY || "";
-        return await callBackend("/aiData/get-material-content-pages", {
-          method: "GET",
-          headers: {
-            "x-api-key": apiKey,
-          },
-        });
-      }
+
       default:
         return { error: true, message: `Unknown tool: ${name}` };
     }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "Tool execution failed";
-    return { error: true, message: msg };
+    return {
+      error: true,
+      message: e instanceof Error ? e.message : "Tool execution failed",
+    };
   }
 }
 
-/** Convert incoming UI history into OpenAI chat messages (system prompt added separately). */
+const SYSTEM_PROMPT =
+  // Identity — carried over from the original General Info agent.
+  "You are a representative of Stone Curators, a company specializing in " +
+  "finding and supplying reclaimed and hard-to-find natural stone from around " +
+  "the world. Your customers are typically architects, landscape architects, " +
+  "interior designers, and construction contractors. ALWAYS treat a question " +
+  "as being about Stone Curators or natural stone, and answer as a Stone " +
+  "Curators representative.\n\n" +
+  "You handle the whole conversation yourself. On EACH new user message, decide " +
+  "fresh which of the three intents below it belongs to. Do not stay locked to " +
+  "the previous topic — if the user moves between intents, follow them.\n\n" +
+  "INTENT 1 — STONE SEARCH (use search_products / get_product_detail).\n" +
+  "The visitor is looking for or inquiring about a natural stone product based " +
+  "on any combination of:\n" +
+  "- stone species (granite, limestone, gneiss, ...)\n" +
+  "- where quarried or gathered (Maine, Italy, Asia, ...)\n" +
+  "- source of the stone (quarried, gathered, reclaimed, ...)\n" +
+  "- dominant color (blue, reddish, dark gray, ...)\n" +
+  "- color feeling (warm, cool, light, dark, ...)\n" +
+  "- color pattern (speckled, cloudy, streaks, ...)\n" +
+  "- surface finish (adze, split-face, honed, flamed, ...)\n" +
+  "- surface finish suitability (wall cladding, exterior paving, rustic paving)\n" +
+  "- general suitability (freeze-thaw conditions, not slippery, high heels, ...)\n" +
+  "- general application (landscape stone, building stone, indoor use, ...)\n" +
+  "- product category (building stone, driveway paving, landscape stone, ...)\n" +
+  "- specific uses (pool deck, steps, interior wall cladding, ...)\n" +
+  "- shapes (planks, cobble, mosaic, flagstone, ...)\n" +
+  "- delivery lead time (available inventory, quick ship, two weeks, 6-8 weeks)\n" +
+  "- relative cost (not expensive, cheap, $$, ...)\n" +
+  "- a Stone Curators URL (stonecurators.com/product/226, /material/1252, ...)\n" +
+  "- product name (Lake Champlain Granite - Veneer, Strata Mist Cross-Cut " +
+  "Gneiss, Stoughton Pond Soapstone - honed, ...)\n" +
+  "- catalog number (p226, P433, m1253, M1133, ...)\n\n" +
+  "INTENT 2 — GENERAL INFO (use search_stone_knowledge).\n" +
+  "The visitor wants information about Stone Curators, or non-search " +
+  "information about natural stone, including:\n" +
+  "- location of Stone Curators\n" +
+  "- what type of clients Stone Curators serves\n" +
+  "- Stone Curators' process for working with designers\n" +
+  "- cultural history of natural stone\n" +
+  "- natural history of stone\n" +
+  "- natural stone type (metamorphic, sedimentary, igneous, ...)\n" +
+  "- natural stone species (granite, limestone, gneiss, ...)\n" +
+  "- installation\n" +
+  "- maintenance and care\n" +
+  "- repair\n\n" +
+  "INTENT 3 — EVERYTHING ELSE.\n" +
+  "The visitor is NOT looking for information about natural stone, Stone " +
+  "Curators, or the products Stone Curators sells. Do not call any tool. " +
+  "Politely explain that you can only help with Stone Curators and natural " +
+  "stone, and offer to help with that instead.\n\n" +
+  "Other tools:\n" +
+  "- get_vietnam_time: time or date questions.\n\n" +
+  "Grounding rules:\n" +
+  "- Answer general questions using ONLY the content returned by " +
+  "search_stone_knowledge. Do not fill gaps from your own knowledge.\n" +
+  "- Never invent catalog codes, product names, or product lists.\n" +
+  "- If a tool returns nothing relevant, say so honestly rather than guessing.\n" +
+  "- When asked about addresses or locations, include the Google Maps link for " +
+  "each location if one is provided in the retrieved content.\n" +
+  "- Use the earlier conversation for context (e.g. 'which ones are white?').\n" +
+  "- After tools return, reply in clear, concise natural language.";
+
 function toOpenAIHistory(
   history: { role?: string; content?: string }[]
 ): ChatCompletionMessageParam[] {
@@ -218,273 +407,175 @@ function toOpenAIHistory(
     );
 }
 
-async function runOpenAIChat(history: { role?: string; content?: string }[]) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return null;
-  }
-
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-  const client = new OpenAI({
-    apiKey,
-    maxRetries: 1,
-    timeout: 60_000,
-  });
-
-  // Single orchestrator agent: one brain, all tools. It re-evaluates every
-  // turn, so a follow-up that switches topic (general info -> product search)
-  // is routed to the right tool automatically, with full conversation context.
-  const systemPrompt =
-    "You are a helpful assistant for natural stone products. " +
-    "You handle everything in one conversation: general information about " +
-    "stone materials/finishes/applications, product search, and product " +
-    "details. On EACH new user message, decide fresh which tool (if any) is " +
-    "needed for that message — do not stay locked to the previous topic. " +
-    "Use search_products or get_product_detail for catalog lookups, " +
-    "get_material_content_pages for background/how-to content, and " +
-    "get_vietnam_time for time questions. " +
-    "Use the tools to get real data from the backend. " +
-    "Never invent catalog codes or product lists. " +
-    "Use the earlier conversation for context (e.g. 'show me more like that'). " +
-    "After tools return, answer in clear, concise natural language.";
-
-  const messages: ChatCompletionMessageParam[] = [
-    { role: "system", content: systemPrompt },
-    ...toOpenAIHistory(history),
-  ];
-
-  const maxRounds = 6;
-  let lastToolName = "";
-
-  for (let round = 0; round < maxRounds; round++) {
-    const completion = await client.chat.completions.create({
-      model,
-      messages,
-      tools: openaiTools,
-      tool_choice: "auto",
-    });
-
-    const choice = completion.choices[0];
-    const assistantMsg = choice?.message;
-    if (!assistantMsg) {
-      break;
-    }
-
-    messages.push(assistantMsg);
-
-    const toolCalls = assistantMsg.tool_calls;
-    if (!toolCalls?.length) {
-      const text = assistantMsg.content?.trim() || "";
-      return NextResponse.json({
-        data: {
-          tool: lastToolName || "openai",
-          answer: text,
-          raw: null,
-        },
-      });
-    }
-
-    for (const tc of toolCalls) {
-      if (tc.type !== "function") continue;
-      lastToolName = tc.function.name;
-      const result = await executeToolCall(
-        tc.function.name,
-        tc.function.arguments
-      );
-      messages.push({
-        role: "tool",
-        tool_call_id: tc.id,
-        content: JSON.stringify(result),
-      });
-    }
-  }
-
-  return NextResponse.json({
-    data: {
-      tool: lastToolName || "openai",
-      answer: "I could not finish the request. Please try again.",
-      raw: null,
-    },
-  });
-}
-
-function selectTool(message: string) {
-  const lower = message.toLowerCase();
-
-  if (
-    lower.includes("time") ||
-    lower.includes("date") ||
-    lower.includes("datetime")
-  ) {
-    return TOOL_NAMES.GET_VIETNAM_TIME;
-  }
-  if (
-    lower.includes("content page") ||
-    lower.includes("material content") ||
-    lower.includes("published material")
-  ) {
-    return TOOL_NAMES.GET_MATERIAL_CONTENT_PAGES;
-  }
-  if (
-    lower.includes("detail") ||
-    lower.includes("catalog") ||
-    /\bM\d{3,}\b/i.test(message)
-  ) {
-    return TOOL_NAMES.GET_PRODUCT_DETAIL;
-  }
-  return TOOL_NAMES.SEARCH_PRODUCTS;
-}
-
-function inferSearchArguments(message: string) {
-  const lower = message.toLowerCase();
-  const materials = ["granite", "marble", "travertine", "limestone", "quartz"];
-  const types = ["slab", "tile", "block"];
-
-  const material = materials.find((m) => lower.includes(m)) || "";
-  const type = types.find((t) => lower.includes(t)) || "";
-  return { query: message, material, type };
-}
-
-function inferProductCode(message: string) {
-  const match = message.match(/\bM\d{3,}\b/i);
-  return match?.[0]?.toUpperCase() || "";
-}
-
-async function runRuleBasedChat(message: string) {
-  const selectedTool = selectTool(message);
-
-  if (selectedTool === TOOL_NAMES.GET_VIETNAM_TIME) {
-    const lower = message.toLowerCase();
-    const endpoint =
-      lower.includes("date") && !lower.includes("time")
-        ? "/aiData/getdate"
-        : lower.includes("datetime")
-          ? "/aiData/getdatetime"
-          : "/aiData/gettime";
-    const data = await callBackend(endpoint);
-    return NextResponse.json({
-      data: {
-        tool: selectedTool,
-        answer: `Vietnam response: ${data.data}`,
-        raw: data,
-      },
-    });
-  }
-
-  if (selectedTool === TOOL_NAMES.GET_MATERIAL_CONTENT_PAGES) {
-    const apiKey = process.env.AI_DATA_API_KEY || "";
-    const data = await callBackend("/aiData/get-material-content-pages", {
-      method: "GET",
-      headers: {
-        "x-api-key": apiKey,
-      },
-    });
-    const pages = Array.isArray(data?.data) ? data.data : [];
-    return NextResponse.json({
-      data: {
-        tool: selectedTool,
-        answer: `Found ${pages.length} published material content pages.`,
-        raw: data,
-      },
-    });
-  }
-
-  if (selectedTool === TOOL_NAMES.GET_PRODUCT_DETAIL) {
-    const code = inferProductCode(message);
-    if (!code) {
-      return NextResponse.json({
-        data: {
-          tool: selectedTool,
-          answer: "Please provide a catalog code, e.g. M608.",
-          raw: null,
-        },
-      });
-    }
-    const data = await callBackend(`/products/${code}`);
-    const row = data.data as {
-      name: string;
-      material: string;
-      type: string;
-      finish: string;
-    };
-    return NextResponse.json({
-      data: {
-        tool: selectedTool,
-        answer: `Product ${code}: ${row.name} (${row.material}, ${row.type}, ${row.finish}).`,
-        raw: data,
-      },
-    });
-  }
-
-  const args = inferSearchArguments(message);
-  const data = await callBackend("/search/products", {
-    method: "POST",
-    body: JSON.stringify(args),
-  });
-
-  const items = Array.isArray(data.data)
-    ? (data.data as {
-        name: string;
-        code: string;
-        material: string;
-        type: string;
-      }[])
-    : [];
-  const top = items.slice(0, 3);
-  const preview = top
-    .map((item) => `${item.name} (${item.code}, ${item.material}, ${item.type})`)
-    .join("; ");
-
-  return NextResponse.json({
-    data: {
-      tool: selectedTool,
-      answer: items.length
-        ? `Found ${items.length} products. Top matches: ${preview}`
-        : "No products matched your request.",
-      raw: data,
-    },
-  });
-}
-
 export async function POST(req: Request) {
+  let body: ChatRequestBody;
   try {
-    const body = (await req.json()) as ChatRequestBody;
-
-    // Accept either the full conversation (preferred) or a single message.
-    const history: { role?: string; content?: string }[] =
-      Array.isArray(body.messages) && body.messages.length
-        ? body.messages
-        : body.message
-          ? [{ role: "user", content: body.message }]
-          : [];
-
-    // The latest user turn — used for the rule-based fallback.
-    const lastUser = [...history]
-      .reverse()
-      .find((m) => m.role !== "assistant" && m.content?.trim());
-    const message = lastUser?.content?.trim();
-
-    if (!message) {
-      return NextResponse.json(
-        { error: true, message: "message is required" },
-        { status: 400 }
-      );
-    }
-
-    if (process.env.OPENAI_API_KEY?.trim()) {
-      try {
-        const openaiResult = await runOpenAIChat(history);
-        if (openaiResult) {
-          return openaiResult;
-        }
-      } catch (openaiErr) {
-        console.error("[api/chat] OpenAI error, falling back:", openaiErr);
-      }
-    }
-
-    return await runRuleBasedChat(message);
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : "Unexpected error";
-    return NextResponse.json({ error: true, message: msg }, { status: 500 });
+    body = (await req.json()) as ChatRequestBody;
+  } catch {
+    return Response.json(
+      { error: true, message: "Invalid JSON body" },
+      { status: 400 }
+    );
   }
+
+  const history =
+    Array.isArray(body.messages) && body.messages.length
+      ? body.messages
+      : body.message
+        ? [{ role: "user", content: body.message }]
+        : [];
+
+  const lastUser = [...history]
+    .reverse()
+    .find((m) => m.role !== "assistant" && m.content?.trim());
+  if (!lastUser?.content?.trim()) {
+    return Response.json(
+      { error: true, message: "message is required" },
+      { status: 400 }
+    );
+  }
+
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  if (!apiKey) {
+    return Response.json(
+      { error: true, message: "OPENAI_API_KEY is not configured" },
+      { status: 500 }
+    );
+  }
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let stepId = 0;
+      const send = (event: Record<string, unknown>) => {
+        controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
+      };
+      /** Emit a step and return its id so it can be completed later. */
+      const startStep = (kind: string, title: string, detail?: string) => {
+        const id = `s${++stepId}`;
+        send({ t: "step", id, kind, title, detail, status: "running" });
+        return { id, at: Date.now() };
+      };
+      const endStep = (
+        step: { id: string; at: number },
+        status: "done" | "error",
+        detail?: string
+      ) => {
+        send({
+          t: "step",
+          id: step.id,
+          status,
+          detail,
+          ms: Date.now() - step.at,
+        });
+      };
+
+      try {
+        const client = new OpenAI({ apiKey, maxRetries: 1, timeout: 60_000 });
+        const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+        const messages: ChatCompletionMessageParam[] = [
+          { role: "system", content: SYSTEM_PROMPT },
+          ...toOpenAIHistory(history),
+        ];
+
+        const maxRounds = 6;
+        for (let round = 0; round < maxRounds; round++) {
+          const thinking = startStep(
+            "intent",
+            round === 0
+              ? "Understanding the question"
+              : "Reviewing tool results",
+            round === 0 ? `"${lastUser.content}"` : undefined
+          );
+
+          const completion = await client.chat.completions.create({
+            model,
+            messages,
+            tools: openaiTools,
+            tool_choice: "auto",
+          });
+
+          const assistantMsg = completion.choices[0]?.message;
+          if (!assistantMsg) {
+            endStep(thinking, "error", "No response from model");
+            send({ t: "error", message: "No response from model" });
+            break;
+          }
+
+          messages.push(assistantMsg);
+          const toolCalls = assistantMsg.tool_calls;
+
+          if (!toolCalls?.length) {
+            endStep(
+              thinking,
+              "done",
+              round === 0 ? "Answered directly (no tool needed)" : "Ready to answer"
+            );
+            const gen = startStep("generate", "Generating response");
+            const answer = assistantMsg.content?.trim() || "";
+            endStep(gen, "done", `${answer.length} characters`);
+            send({ t: "answer", answer });
+            break;
+          }
+
+          endStep(
+            thinking,
+            "done",
+            `Routing to: ${toolCalls
+              .map((tc) => (tc.type === "function" ? tc.function.name : tc.type))
+              .join(", ")}`
+          );
+
+          for (const tc of toolCalls) {
+            if (tc.type !== "function") continue;
+            const toolName = tc.function.name;
+            const label = TOOL_LABELS[toolName] || toolName;
+
+            let argPreview = tc.function.arguments;
+            try {
+              argPreview = JSON.stringify(JSON.parse(tc.function.arguments));
+            } catch {
+              /* keep raw string if it is not valid JSON */
+            }
+
+            const step = startStep("tool", label, argPreview);
+            const result = await executeToolCall(
+              client,
+              toolName,
+              tc.function.arguments
+            );
+            const failed = (result as { error?: boolean })?.error === true;
+            endStep(
+              step,
+              failed ? "error" : "done",
+              summarizeResult(toolName, result)
+            );
+
+            messages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: JSON.stringify(result),
+            });
+          }
+        }
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Unexpected server error";
+        console.error("[api/chat] error:", err);
+        send({ t: "error", message });
+      } finally {
+        send({ t: "done" });
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    },
+  });
 }
