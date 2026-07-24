@@ -38,6 +38,10 @@ async function callApi(path, { auth = false } = {}) {
         "AI_DATA_API_KEY is not set — this endpoint requires an API key."
       );
     }
+    // The server authenticates on the `x-getdata-key` header (confirmed working
+    // in Tuyen's Postman test). The guide originally documented `x-api-key`, so
+    // both names are sent with the same value to stay compatible either way.
+    headers["x-getdata-key"] = API_KEY;
     headers["x-api-key"] = API_KEY;
   }
 

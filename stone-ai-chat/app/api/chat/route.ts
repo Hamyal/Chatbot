@@ -222,6 +222,13 @@ async function callBackend(path: string, options?: RequestInit) {
  * `+` between words — e.g. `/aiData/getsearch?gray+granite+in+a+cool+tone` —
  * not as a named `keyword=` parameter.
  */
+// The catalog authenticates on `x-getdata-key` (confirmed in Tuyen's Postman
+// test); the guide originally said `x-api-key`. Send both with the same value.
+function authHeaders(): Record<string, string> {
+  const key = process.env.AI_DATA_API_KEY || "";
+  return { "x-getdata-key": key, "x-api-key": key };
+}
+
 async function callSearch(keywords: string) {
   const words = keywords
     .trim()
@@ -232,7 +239,7 @@ async function callSearch(keywords: string) {
     return { error: true, message: "Empty search keywords" };
   }
   return await callBackend(`/aiData/getsearch?${words.join("+")}`, {
-    headers: { "x-api-key": process.env.AI_DATA_API_KEY || "" },
+    headers: authHeaders(),
   });
 }
 
@@ -339,7 +346,19 @@ async function executeToolCall(
         const keywords = [String(args.query ?? "").trim(), extras]
           .filter(Boolean)
           .join(" ");
-        return await callSearch(keywords);
+        const result = await callSearch(keywords);
+        // getsearch currently returns an empty list for every query (a
+        // server-side index issue). Treat "no results" as a signal to fall
+        // back to the knowledge base rather than letting the agent give up.
+        const rows = (result as { data?: unknown })?.data;
+        if (Array.isArray(rows) && rows.length === 0) {
+          return {
+            error: true,
+            message:
+              "Catalog search returned no results — call search_stone_knowledge with the same request instead.",
+          };
+        }
+        return result;
       }
 
       case TOOL_NAMES.GET_PRODUCT_DETAIL: {
@@ -352,7 +371,7 @@ async function executeToolCall(
 
       case TOOL_NAMES.GET_MATERIAL_CONTENT_PAGES:
         return await callBackend("/aiData/get-material-content-pages", {
-          headers: { "x-api-key": process.env.AI_DATA_API_KEY || "" },
+          headers: authHeaders(),
         });
 
       case TOOL_NAMES.GET_VIETNAM_TIME: {
