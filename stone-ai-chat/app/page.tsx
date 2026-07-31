@@ -189,7 +189,8 @@ export default function Home() {
             content,
           })),
         }),
-        signal: AbortSignal.timeout(120_000),
+        // getsearch can be slow (~70s cold), so allow ample total time.
+        signal: AbortSignal.timeout(180_000),
       });
 
       if (!response.body) {

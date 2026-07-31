@@ -22,7 +22,8 @@ type ChatRequestBody = {
 };
 
 const MAX_HISTORY_MESSAGES = 20;
-const BACKEND_FETCH_MS = 25_000;
+// getsearch can take up to ~70s when cold, so allow a generous ceiling.
+const BACKEND_FETCH_MS = 90_000;
 
 const TOOL_NAMES = {
   SEARCH_KNOWLEDGE: "search_stone_knowledge",

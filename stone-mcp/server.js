@@ -20,7 +20,8 @@ const API_BASE_URL = (
 ).replace(/\/+$/, "");
 const API_KEY = process.env.AI_DATA_API_KEY || "";
 
-const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 25_000);
+// getsearch can be slow — up to ~70s cold — so allow a generous ceiling.
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 90_000);
 
 /**
  * Call one AI Data endpoint.
